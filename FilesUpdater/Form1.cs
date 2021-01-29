@@ -15,14 +15,14 @@ namespace FilesUpdater
         private string _logFileName;
         private string _hostErrorsFileName;
         private readonly string _workDirectory;
-        //private readonly object _writeLogSync = new object();
-        private CancellationTokenSource tokenSource;
+        private CancellationTokenSource _tokenSource;
+        private Task _task;
 
         public Form1()
         {
             InitializeComponent();
 
-            tokenSource = new CancellationTokenSource();
+            _tokenSource = new CancellationTokenSource();
             _workDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
         }
 
@@ -61,17 +61,17 @@ namespace FilesUpdater
             try
             {
                 if (state == null)
-                    throw new ArgumentNullException("state");
+                    throw new ArgumentNullException("Отсутствует состояние");
 
                 var uiState = state as ProgressState;
                 if (uiState == null)
-                    throw new NullReferenceException("Ошибка получения параметров для обновления прогресса");
+                    throw new NullReferenceException("Ошибка получения состояния");
 
                 toolStripProgressBar1.Value = uiState.ProgressValue;
                 toolStripStatusLabel3.Text = uiState.HostName;
                 WriteMessageToLog(uiState);
 
-                if (uiState.State == EventType.Complete || uiState.State == EventType.Cancellation)
+                if (uiState.State == EventType.Complete)
                     ChangeUserInterface(false);
             }
             catch (Exception ex)
@@ -85,23 +85,26 @@ namespace FilesUpdater
             try
             {
                 if (state == null)
-                    throw new ArgumentNullException("state");
+                    throw new ArgumentNullException("Отсутствует состояние");
 
-                var uiState = state as ProgressState;
-                if (uiState == null)
-                    throw new NullReferenceException("Ошибка получения параметров для обновления прогресса");
+                if (!(state is ProgressState uiState))
+                    throw new NullReferenceException("Ошибка получения состояния");
 
                 WriteMessageToLog(uiState);
 
-                if (uiState.State == EventType.Complete || uiState.State == EventType.Cancellation)
+                if (uiState.State == EventType.Complete)
                     ChangeUserInterface(false);
             }
-            catch (Exception) { }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка добавления записи в лог:\n{ex.Message}");
+            }
         }
 
         private void ChangeUserInterface(bool isEnabled)
         {
             button1.Enabled = !isEnabled;
+            button2.Enabled = isEnabled;
 
             toolStripStatusLabel1.Visible = isEnabled;
             toolStripStatusLabel3.Visible = isEnabled;
@@ -131,9 +134,6 @@ namespace FilesUpdater
                         ? $"{uiState.Message}\n"
                         : $"{uiState.HostName}\t{uiState.Message}\n");
                     Logger.WriteLog(_logFileName, Logger.WrapMessage(uiState.HostName, uiState.Message));
-                    break;
-                case EventType.Cancellation:
-                    richTextBox2.AppendText($"{uiState.Message}\n");
                     break;
                 default:
                     throw new ArgumentOutOfRangeException();
@@ -170,9 +170,9 @@ namespace FilesUpdater
 
             try
             {
-                //TODO: Проверить корректноость реализации с токенами отмены
-                tokenSource = new CancellationTokenSource();
-                var token = tokenSource.Token;
+                //TODO: Проверить корректность реализации с токенами отмены
+                _tokenSource = new CancellationTokenSource();
+                var token = _tokenSource.Token;
 
                 var data = new TaskParams()
                 {
@@ -192,8 +192,8 @@ namespace FilesUpdater
                 ChangeUserInterface(true);
 
                 Action<object> action = RunCopyFiles;
-                var task = new Task(action, data, token);
-                task.Start();
+                _task = new Task(action, data, token);
+                _task.Start();
             }
             catch (Exception ex)
             {
@@ -203,7 +203,20 @@ namespace FilesUpdater
 
         private void button2_Click(object sender, EventArgs e)
         {
-            tokenSource.Cancel();
+            try
+            {
+                _tokenSource.Cancel();
+                _task.Wait();
+            }
+            catch (AggregateException ex)
+            {
+                MessageBox.Show($"Ошибка выполнения потока обработки данных:\n{ex.InnerExceptions[0]?.Message}");
+            }
+            catch (Exception iex)
+            {
+                MessageBox.Show($"Ошибка выполнения потока обработки данных:\n{iex.Message}");
+            }
+
             ChangeUserInterface(false);
         }
 
@@ -226,42 +239,36 @@ namespace FilesUpdater
             if (uiContext == null)
                 throw new NullReferenceException("uiContext");
 
-            if (data.Token.IsCancellationRequested)
-            {
-                uiContext.Post(UpdateProgress, new ProgressState(EventType.Cancellation, String.Empty, "Принудительная остановка процесса обработки"));
-                return;
-            }
-
             uiContext.Post(UpdateProgress, new ProgressState(EventType.Info, String.Empty, "Запуск процесса обработки"));
             var progressVal = 1;
 
             foreach (var host in data.DestinationHostNames)
             {
-                //Thread.Sleep(2000);
-                if (data.Token.IsCancellationRequested)
-                {
-                    uiContext.Post(UpdateProgress, new ProgressState(EventType.Cancellation, progressVal, host, "Принудительная остановка процесса обработки"));
-                    return;
-                    //data.Token.ThrowIfCancellationRequested();
-                }
-
-                if (string.IsNullOrEmpty(host.Trim()))
-                {
-                    progressVal++;
-                    continue;
-                }
-
                 try
                 {
+                    if (data.Token.IsCancellationRequested)
+                    {
+                        data.Token.ThrowIfCancellationRequested();
+                    }
+
+                    if (string.IsNullOrEmpty(host.Trim()))
+                    {
+                        progressVal++;
+                        continue;
+                    }
+
                     HandleData(data, host, data.SourcePath, Path.Combine($@"\\{host}", data.DestinationPath));
+                    uiContext.Post(UpdateProgress, new ProgressState(EventType.Info, progressVal, host, "Копирование файлов и директорий завершено"));
+                }
+                catch (OperationCanceledException)
+                {
+                    uiContext.Post(UpdateProgress, new ProgressState(EventType.Complete, host, "Принудительная остановка процесса обработки"));
+                    return;
                 }
                 catch (Exception ex)
                 {
-                    uiContext.Post(UpdateProgress, new ProgressState(EventType.Error, progressVal, host, ex.Message));
-                    continue;
+                    uiContext.Post(UpdateProgress, new ProgressState(EventType.Error, progressVal++, host, ex.Message));
                 }
-
-                uiContext.Post(UpdateProgress, new ProgressState(EventType.Info, progressVal++, host, "Копирование файлов и директорий завершено"));
             }
 
             uiContext.Post(UpdateProgress, new ProgressState(EventType.Complete, String.Empty, "Процесс обработки завершен"));
@@ -272,7 +279,8 @@ namespace FilesUpdater
             if (data.ExecuteInternalDirectories)
                 HandleDirectories(data, host, sourcePath, destPath);
 
-            //Создание файлов необходимо выполнять после создания директории, либо реализовать создание директорий перед рекурсивным вызовом HandleData
+            // Создание файлов необходимо выполнять после создания директории,
+            // либо реализовать создание директорий перед рекурсивным вызовом HandleData
             HandleFiles(data, host, sourcePath, destPath);
         }
 
@@ -283,13 +291,22 @@ namespace FilesUpdater
                 var directories = Directory.EnumerateDirectories(sourcePath);
                 foreach (var directory in directories)
                 {
-                    var sections = directory.Split(new[] { @"\" }, StringSplitOptions.RemoveEmptyEntries);
+                    if (data.Token.IsCancellationRequested)
+                    {
+                        data.Token.ThrowIfCancellationRequested();
+                    }
+
+                    var sections = directory.Split(new[] {@"\"}, StringSplitOptions.RemoveEmptyEntries);
                     var dir = sections[sections.Length - 1];
                     HandleData(data, host, directory, Path.Combine(destPath, dir));
                 }
-                
+
                 if (!Directory.Exists(destPath))
                     Directory.CreateDirectory(destPath);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -305,6 +322,11 @@ namespace FilesUpdater
 
                 foreach (var file in files)
                 {
+                    if (data.Token.IsCancellationRequested)
+                    {
+                        data.Token.ThrowIfCancellationRequested();
+                    }
+
                     var fileName = file.Substring(sourcePath.Length + 1);
                     var destFileName = Path.Combine(destPath, fileName);
 
@@ -333,6 +355,10 @@ namespace FilesUpdater
                     }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 data.Context.Post(AddMessageHistory, new ProgressState(EventType.Error, host, ex.Message));
@@ -352,14 +378,9 @@ namespace FilesUpdater
 
         private void PrepareCommandScript(TaskParams data, string host, string fileName)
         {
-            //TODO: Проверить работу при нескольких потоках (из отмененных потоков добавляется)
-            var @params = new Dictionary<string, string>();
-            @params.Add("HostName", host);
-            @params.Add("ProcessName", fileName);
-
+            var @params = new Dictionary<string, string> {{"HostName", host}, {"ProcessName", fileName}};
             ExecuteCommandScript(data.ScriptParams, @params);
             data.Context.Post(AddMessageHistory, new ProgressState(EventType.Info, host, "Выполнение скрипта завершено"));
-
             Thread.Sleep(data.ScriptTimeout);
         }
 

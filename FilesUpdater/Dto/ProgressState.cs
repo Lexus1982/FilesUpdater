@@ -7,7 +7,7 @@ namespace FilesUpdater.DTO
         public int ProgressValue { get; set; }
         public string HostName { get; set; }
         public string Message { get; set; }
-        public /*OperationState*/ EventType State { get; set; }
+        public EventType State { get; set; }
 
         public ProgressState() : this(EventType.Info, 0, string.Empty, string.Empty) { }
         public ProgressState(EventType state, string hostName, string message) : this(state, 0, hostName, message) { }
@@ -25,7 +25,6 @@ namespace FilesUpdater.DTO
     {
         Info,
         Error,
-        Complete,
-        Cancellation
+        Complete
     }
 }
